@@ -1,0 +1,217 @@
+import { queryEvents, fetchEventDetailed } from "../rabta/index.js";
+import { getKnownRelays } from "./selection.js";
+import { recordOutcomes } from "./outcomes.js";
+
+const POLL_INTERVAL_MS = 1000;
+const POLL_MAX_BACKOFF_MS = 15000;
+const GROUP_COLLECTION = "gupt/chat/group";
+const RECEIPT_COLLECTION = "gupt/chat/receipts";
+const HEX64_RE = /^[0-9a-f]{64}$/i;
+const SEEN_IDS_MAX = 500;
+
+/** A receipts event is group shaped when every label is a member key. */
+function isGroupReceiptShape(event) {
+  if (event?.collection !== RECEIPT_COLLECTION) return false;
+  const labels = Array.isArray(event.labels) ? event.labels : [];
+  return labels.length >= 2 && labels.every((label) => HEX64_RE.test(String(label)));
+}
+
+function adaptFilterToRabtaQuery(filter) {
+  const query = {};
+  if (filter.collection) query.collection = filter.collection;
+  if (filter.labels) query.labels = Array.isArray(filter.labels) ? filter.labels : [filter.labels];
+  if (filter.owner) query.owner = filter.owner;
+  if (filter.limit) query.limit = Math.min(Math.max(1, Number(filter.limit) || 20), 100);
+  if (filter.cursor) query.cursor = filter.cursor;
+  if (filter.since != null && Number.isFinite(Number(filter.since))) {
+    query.since = Number(filter.since);
+  }
+  if (filter.until != null && Number.isFinite(Number(filter.until))) {
+    query.until = Number(filter.until);
+  }
+
+  if (!query.collection && filter["#t"] && filter["#t"].length) {
+    const tag = filter["#t"][0];
+    if (tag.startsWith("gupt_note")) query.collection = "gupt/vault/notes";
+    else if (tag.startsWith("gupt_contact")) query.collection = "gupt/vault/contacts";
+    else if (tag.startsWith("gupt_task")) query.collection = "gupt/vault/tasks";
+    else if (tag.startsWith("gupt_password")) query.collection = "gupt/vault/passwords";
+    else if (tag.startsWith("gupt_bookmark")) query.collection = "gupt/vault/bookmarks";
+    else if (tag.startsWith("gupt_feed")) query.collection = "gupt/feed";
+    query.labels = filter["#t"];
+  }
+
+  if (!query.owner && filter.authors && filter.authors.length) {
+    const author = filter.authors[0];
+    query.owner = author.startsWith("ed25519:") ? author : `ed25519:${author}`;
+  }
+
+  if (!query.labels && filter["#p"] && filter["#p"].length) {
+    const peer = filter["#p"][0];
+    query.labels = [peer];
+  }
+
+  if (!query.collection && filter.kinds) {
+    if (filter.kinds.includes(4)) query.collection = "gupt/chat/dm";
+    else if (filter.kinds.includes(0)) query.collection = "gupt/profiles";
+    else if (filter.kinds.includes(20004)) query.collection = "gupt/calls/signal";
+  }
+
+  return query;
+}
+
+function adaptRabtaEventToAppShape(ev) {
+  if (!ev) return null;
+  if (!ev.pubkey && ev.owner) {
+    ev.pubkey = ev.owner.replace(/^ed25519:/i, "");
+  }
+  if (!ev.content && ev.data) {
+    if (typeof ev.data === "string") {
+      ev.content = ev.data;
+    } else if (ev.data.ciphertext && ev.data.nonce) {
+      ev.content = `v1:${ev.data.nonce}:${ev.data.ciphertext}`;
+    } else if (ev.data.content) {
+      ev.content = ev.data.content;
+    } else {
+      ev.content = "";
+    }
+  }
+  if (!ev.tags) {
+    const tags = [];
+    const labels = Array.isArray(ev.labels) ? ev.labels : [];
+    const isGroup = ev.collection === GROUP_COLLECTION || isGroupReceiptShape(ev);
+    let recipientPubkey = null;
+
+    for (const l of labels) {
+      if (typeof l === "string" && /^[0-9a-f]{64}$/i.test(l)) {
+        const pubkey = l.toLowerCase();
+        if (!isGroup) recipientPubkey = pubkey;
+        tags.push(["p", pubkey]);
+      } else {
+        tags.push(["t", l]);
+      }
+    }
+
+    if (ev.collection && !tags.some((t) => t[0] === "t" && t[1] === ev.collection)) {
+      tags.push(["t", ev.collection]);
+    }
+    if (ev.expires_at) {
+      tags.push(["expiration", String(ev.expires_at)]);
+    }
+
+    ev.tags = tags;
+    if (recipientPubkey) {
+      ev.recipientPubkey = recipientPubkey;
+      ev.peerPubkey = recipientPubkey;
+    }
+  }
+  if (ev.kind === undefined) {
+    if (ev.data?.kind !== undefined) {
+      ev.kind = ev.data.kind;
+    } else if (
+      ev.collection === "gupt/chat/dm" ||
+      ev.collection === GROUP_COLLECTION ||
+      ev.collection === RECEIPT_COLLECTION
+    ) {
+      ev.kind = 4;
+    } else if (ev.collection === "gupt/profiles") {
+      ev.kind = 0;
+    } else if (ev.collection === "gupt/calls/signal") {
+      ev.kind = 20004;
+    } else if (ev.collection === "gupt/feed") {
+      ev.kind = 1;
+    }
+  }
+  return ev;
+}
+
+export async function query(filter, maxWait = 5000) {
+  const relays = getKnownRelays();
+  const list = Array.isArray(filter) ? filter : [filter];
+  const allEvents = [];
+  const seen = new Set();
+
+  for (const f of list) {
+    if (f.ids && f.ids.length === 1) {
+      const { event: single, outcomes } = await fetchEventDetailed(f.ids[0], relays);
+      recordOutcomes("query", outcomes);
+      if (single && !seen.has(single.id)) {
+        seen.add(single.id);
+        allEvents.push(adaptRabtaEventToAppShape(single));
+      }
+      continue;
+    }
+
+    const q = adaptFilterToRabtaQuery(f);
+    const res = await queryEvents(q, relays, maxWait);
+    recordOutcomes("query", res.relayResults);
+    for (const ev of res.events || []) {
+      if (!seen.has(ev.id)) {
+        seen.add(ev.id);
+        allEvents.push(adaptRabtaEventToAppShape(ev));
+      }
+    }
+  }
+
+  return allEvents;
+}
+
+/**
+ * Polling stands in for a relay subscription. Each poll schedules the next
+ * only after it settles, so a slow or hung relay can never stack requests.
+ */
+export async function subscribe(
+  relays,
+  filters,
+  observer,
+  maxWait = 5000,
+  intervalMs = POLL_INTERVAL_MS,
+) {
+  let stopped = false;
+  let timer = null;
+  let inFlight = false;
+  const baseInterval = Math.max(250, Number(intervalMs) || POLL_INTERVAL_MS);
+  let backoffMs = baseInterval;
+  const seenIds = new Set();
+
+  async function poll() {
+    if (stopped || inFlight) return;
+    inFlight = true;
+    let delay = baseInterval;
+    try {
+      const events = await query(filters, maxWait);
+      if (stopped) return;
+      for (const ev of events) {
+        if (!ev?.id || seenIds.has(ev.id)) continue;
+        seenIds.add(ev.id);
+        if (seenIds.size > SEEN_IDS_MAX) {
+          const oldest = seenIds.values().next().value;
+          seenIds.delete(oldest);
+        }
+        observer?.next?.(ev);
+      }
+      backoffMs = baseInterval;
+    } catch (err) {
+      if (stopped) return;
+      delay = backoffMs;
+      backoffMs = Math.min(backoffMs * 2, Math.max(POLL_MAX_BACKOFF_MS, baseInterval));
+      observer?.error?.(err);
+    } finally {
+      inFlight = false;
+      if (!stopped) timer = setTimeout(poll, delay);
+    }
+  }
+
+  void poll();
+
+  return {
+    unsubscribe() {
+      stopped = true;
+      if (timer) {
+        clearTimeout(timer);
+        timer = null;
+      }
+      seenIds.clear();
+    },
+  };
+}

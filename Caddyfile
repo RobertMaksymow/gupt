@@ -1,0 +1,57 @@
+:8000 {
+    root * /srv
+    file_server
+
+    # SPA fallback — rewrites unknown paths to index.html
+    try_files {path} /index.html
+
+    # Security headers
+    header {
+        X-Content-Type-Options nosniff
+        X-Frame-Options DENY
+        Referrer-Policy strict-origin-when-cross-origin
+        # Remove Caddy's Server header
+        -Server
+
+        # Same policy as the <meta> tag in index.html — keep the two in sync.
+        # As a real header it can carry frame-ancestors, which browsers ignore
+        # when CSP arrives via <meta>.
+        #
+        # frame-src / worker-src / manifest-src are spelled out even though they
+        # already resolve to 'self' through default-src, so that the intent is
+        # visible next to the directive it constrains. There is no third-party
+        # frame source: that is what keeps a location message from leaking the
+        # reader's IP to a tile server. See the note in index.html.
+        Content-Security-Policy "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; connect-src 'self' ws: wss: http: https: blob:; img-src 'self' data: blob: http: https:; media-src 'self' blob: data: http: https:; font-src 'self' data:; object-src 'none'; base-uri 'none'; form-action 'none'; frame-src 'self'; worker-src 'self'; manifest-src 'self'; frame-ancestors 'none'"
+    }
+
+    # HSTS only over TLS: sent in the clear it is ignored by browsers anyway, and
+    # advertising a max-age on a plain-HTTP listener buys nothing.
+    @tls expression {http.request.scheme} == "https"
+    header @tls Strict-Transport-Security "max-age=31536000"
+
+    # Gzip compression (Caddy does this automatically via zstd + gzip)
+    encode zstd gzip
+
+    # Cache static assets aggressively (Vite fingerprints JS/CSS). The service
+    # worker is the exception: its URL is stable but its bytes are the update,
+    # so it must revalidate instead of being pinned for a year.
+    @static {
+        path *.js *.css *.woff2 *.woff *.ttf *.ico *.png *.jpg *.svg *.webp
+        not path /sw.js
+    }
+    header @static Cache-Control "public, max-age=31536000, immutable"
+
+    # Never cache index.html (so deploys take effect immediately)
+    @html path *.html
+    header @html Cache-Control "no-cache"
+
+    # The service worker and the web app manifest describe the current deploy.
+    # Keep this in sync with bin/httpCache.js, used by the npx server.
+    @revalidate path /sw.js /manifest.webmanifest
+    header @revalidate Cache-Control "no-cache"
+
+    # Spell out the manifest type rather than trust the host's mime.types.
+    @manifest path /manifest.webmanifest
+    header @manifest Content-Type "application/manifest+json"
+}

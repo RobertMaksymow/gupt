@@ -1,0 +1,27 @@
+node_modules
+.npm-cache
+dist
+
+# build outputs
+build/
+bundle/
+
+# flatpak local build cache
+.flatpak-builder/
+
+# stray lockfile (project uses npm / package-lock.json)
+bun.lock
+
+# local audit notes (never committed)
+audit.txt
+plan.md
+
+# OpenChamber session artifacts (screenshots, project state)
+.openchamber/
+
+# Ori tool state
+.ori/
+
+# AI-agent integration docs live in the gupt-skill gist:
+# https://gist.github.com/besoeasy/098bbed1f63a57a16f208c15155fbf7c
+gupt-for-ai-agents/

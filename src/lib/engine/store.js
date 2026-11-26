@@ -1,0 +1,280 @@
+// Engine-backed store. Works identically on the main thread and in the
+// replication worker — IndexedDB supports concurrent connections.
+import {
+  completeOutboxEvent,
+  countLocalRawEvents,
+  evictEngineBlobs,
+  getEngineBlob,
+  getEngineCursor,
+  getEngineWatermark,
+  getLatestRawEventCreatedAt,
+  getOutboxSnapshot,
+  getOutboxEntry,
+  getRawEventsByIds,
+  getRelayScores,
+  hasEngineBlob,
+  listOutboxEvents,
+  putEngineBlob,
+  putEngineCursor,
+  putRawEvent,
+  recordOutboxRelayState,
+  retryOutboxEvent,
+  scheduleOutboxRetry,
+  setEngineWatermark,
+} from "../idb.js";
+import { dmRoomId, normalizePubkey } from "../crypto.js";
+import {
+  GROUP_COLLECTION,
+  groupIdForMembers,
+  isGroupCopyEvent,
+  parseGroupMembers,
+} from "../groupIdentity.js";
+import { RECEIPT_COLLECTION, RECEIPT_TYPE } from "../receipts.js";
+import { verifyEvent } from "../rabta/index.js";
+import { ENGINE_APP_COLLECTIONS, ENGINE_CHAT_COLLECTION, ENGINE_ORIGINS } from "./core.js";
+
+export { ENGINE_ORIGINS } from "./core.js";
+const ENGINE_APPLIED_ORIGIN = "dm";
+const GROUP_MSG_TAG = "gupt:group-msg";
+const CHAT_KIND_COLLECTIONS = new Set([
+  ENGINE_CHAT_COLLECTION,
+  GROUP_COLLECTION,
+  RECEIPT_COLLECTION,
+]);
+const APP_ORIGIN_BY_COLLECTION = new Map(
+  ENGINE_APP_COLLECTIONS.map(({ origin, collection }) => [collection, origin]),
+);
+// Engine pulls must stay inside the collections the store knows how to
+// route; the umbrella glob spec can surface anything else we own (call
+// signaling, misc defaults) and those rows would pollute the DM store.
+const ENGINE_KNOWN_COLLECTIONS = new Set([
+  ...APP_ORIGIN_BY_COLLECTION.keys(),
+  ENGINE_CHAT_COLLECTION,
+  GROUP_COLLECTION,
+  RECEIPT_COLLECTION,
+]);
+const HEX_RE = /^[0-9a-f]{64}$/i;
+
+function normalizeHex(value) {
+  return normalizePubkey(
+    String(value || "")
+      .toLowerCase()
+      .replace(/^ed25519:/, ""),
+  );
+}
+
+function groupTagOf(event) {
+  if (Array.isArray(event?.labels) && event.labels.includes(GROUP_MSG_TAG)) return true;
+  return event?.tags?.find((t) => t[0] === "t")?.[1] === GROUP_MSG_TAG;
+}
+
+function counterpartyOf(event, selfHex) {
+  const normSelf = normalizeHex(selfHex);
+  const owner = normalizeHex(event?.owner || event?.pubkey);
+  if (owner && owner !== normSelf) return owner;
+  const labels = Array.isArray(event?.labels) ? event.labels : [];
+  return labels.map(normalizeHex).find((l) => l && l !== normSelf) || null;
+}
+
+// Relay responses drop tags and return pubkey as owner. App-level parsers still
+// expect both, so rebuild them before storing an inbound app event.
+function appEventShape(event) {
+  const next = { ...event };
+  if (!next.pubkey && next.owner) next.pubkey = normalizeHex(next.owner);
+  if (!Array.isArray(next.tags)) {
+    const tags = [];
+    for (const label of Array.isArray(next.labels) ? next.labels : []) {
+      if (HEX_RE.test(String(label))) tags.push(["p", String(label)]);
+      else tags.push(["t", String(label)]);
+    }
+    if (next.expires_at) tags.push(["expiration", String(next.expires_at)]);
+    next.tags = tags;
+  }
+  if (next.kind === undefined) {
+    next.kind =
+      next.collection === "gupt/profiles" ? 0 : CHAT_KIND_COLLECTIONS.has(next.collection) ? 4 : 1;
+  }
+  return next;
+}
+
+export function createEngineStore({ blobs, log = () => {}, selfHex = null } = {}) {
+  const self = normalizeHex(selfHex);
+  return {
+    // Replication invariant: every locally stored row (authored or received)
+    // must exist on every configured relay. Relays dedupe by event id, so
+    // re-pushing received events is idempotent.
+    async listUnsyncedEvents(limit = 25) {
+      return listOutboxEvents(limit, { origins: ENGINE_ORIGINS });
+    },
+
+    async recordOutboxRelayState(eventId, relay, patch) {
+      return recordOutboxRelayState(eventId, relay, patch);
+    },
+
+    async getOutboxEntry(eventId) {
+      return getOutboxEntry(eventId);
+    },
+
+    async scheduleOutboxRetry(eventId, options) {
+      return scheduleOutboxRetry(eventId, options);
+    },
+
+    async completeOutboxEvent(eventId) {
+      return completeOutboxEvent(eventId);
+    },
+
+    async retryOutboxEvent(eventId) {
+      return retryOutboxEvent(eventId);
+    },
+
+    async getRelayScores() {
+      return getRelayScores();
+    },
+
+    async getOutboxStatus() {
+      return getOutboxSnapshot({
+        origins: ENGINE_ORIGINS,
+      });
+    },
+
+    async hasEventIds(ids) {
+      const rows = await getRawEventsByIds(ids);
+      return new Set(rows.map((r) => r.id));
+    },
+
+    async getEventsByIds(ids) {
+      return getRawEventsByIds(ids);
+    },
+
+    async putInboundEvent(event, selfHex) {
+      if (!event?.id) return false;
+      const self = normalizeHex(selfHex);
+      if (!self) throw new Error("putInboundEvent requires self pubkey");
+      if (!verifyEvent(event)) {
+        log(`rejected invalid event ${String(event.id).slice(0, 12)}`);
+        return false;
+      }
+      const collection = String(event.collection || "");
+      if (!ENGINE_KNOWN_COLLECTIONS.has(collection)) return false;
+
+      const owner = normalizeHex(event.owner || event.pubkey);
+      const appOrigin = APP_ORIGIN_BY_COLLECTION.get(collection);
+      if (appOrigin) {
+        if (owner !== self) return false;
+        await putRawEvent(appEventShape(event), appOrigin);
+        return true;
+      }
+
+      // One receipts collection, two envelopes. The v2 copies shape is checked
+      // first; a DM receipt's labels can never pass parseGroupMembers, so the
+      // two never collide.
+      if (collection === RECEIPT_COLLECTION) {
+        if (isGroupCopyEvent(event)) {
+          const members = parseGroupMembers(event.labels);
+          if (!members.includes(self) || !members.includes(owner)) return false;
+          await putRawEvent(appEventShape(event), "group", {
+            groupId: groupIdForMembers(members),
+            type: RECEIPT_TYPE,
+          });
+          return true;
+        }
+        const peer = counterpartyOf(event, self);
+        if (!peer) return false;
+        const roomId = await dmRoomId(self, peer).catch(() => null);
+        await putRawEvent(appEventShape(event), "dm", {
+          peerPubkey: peer,
+          roomId,
+          type: RECEIPT_TYPE,
+        });
+        return true;
+      }
+
+      if (collection === GROUP_COLLECTION) {
+        const members = parseGroupMembers(event.labels);
+        if (!members || !members.includes(self)) return false;
+        if (!members.includes(normalizeHex(owner))) return false;
+        if (Number(event.data?.v) !== 2) return false;
+        if (!Array.isArray(event.data?.copies) || event.data.copies.length !== members.length) {
+          return false;
+        }
+        await putRawEvent(appEventShape(event), "group", {
+          groupId: groupIdForMembers(members),
+        });
+        return true;
+      }
+
+      const isGroup = groupTagOf(event);
+      const peer = counterpartyOf(event, self);
+
+      // A group fan-out copy aimed at another member is delivery-only; the
+      // sender's self copy is the record and recipients pull their own copy.
+      if (isGroup && owner === self && peer && peer !== self) {
+        return false;
+      }
+
+      // Group ids live in the encrypted payload; the main thread upgrades the
+      // denorm once it decrypts this row. Our own self copy must stay
+      // addressable so a fresh device can rebuild group history.
+      if (isGroup) {
+        const groupPeer = peer || (owner === self ? self : null);
+        if (!groupPeer) return false;
+        await putRawEvent(event, ENGINE_APPLIED_ORIGIN, { peerPubkey: groupPeer, roomId: null });
+        return true;
+      }
+
+      if (!peer) return false;
+      const roomId = await dmRoomId(self, peer).catch(() => null);
+      await putRawEvent(appEventShape(event), ENGINE_APPLIED_ORIGIN, {
+        peerPubkey: peer,
+        roomId,
+      });
+      return true;
+    },
+
+    async getBlobBytes(hash) {
+      // Blob adapter re-hashes local bytes, drops corrupt rows, and fetches a
+      // verified copy from a relay when needed. Never return raw cache bytes.
+      if (blobs?.getBlobBytesFromRelays) return blobs.getBlobBytesFromRelays(hash);
+      return getEngineBlob(hash);
+    },
+
+    async hasLocalBlob(hash) {
+      return hasEngineBlob(hash);
+    },
+
+    async putBlobBytes(hash, bytes, { expiresAt = null } = {}) {
+      const stored = await putEngineBlob(hash, bytes, { expiresAt });
+      void evictEngineBlobs().catch(() => {});
+      return stored;
+    },
+
+    async getPullCursor(key) {
+      return getEngineCursor(key);
+    },
+
+    async putPullCursor(key, cursor) {
+      return putEngineCursor(key, cursor);
+    },
+
+    async getWatermark(key) {
+      return getEngineWatermark(key);
+    },
+
+    async setWatermark(key, ts) {
+      return setEngineWatermark(key, ts);
+    },
+
+    async countLocalEvents({
+      startSec = 0,
+      endSec = Number.MAX_SAFE_INTEGER,
+      owner = null,
+      label = null,
+    } = {}) {
+      return countLocalRawEvents({ startSec, endSec, owner, label });
+    },
+
+    async getLatestCreatedAt(origin = null) {
+      return getLatestRawEventCreatedAt({ origin });
+    },
+  };
+}

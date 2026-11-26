@@ -1,0 +1,24 @@
+export const RETENTION_DAYS = 366;
+
+export const STREAM_EXPIRY_SECONDS = RETENTION_DAYS * 24 * 60 * 60;
+export const STREAM_DELETE_EXPIRY_SECONDS = 10 * 365 * 24 * 60 * 60;
+
+export function readConfiguredRetentionDays() {
+  return RETENTION_DAYS;
+}
+
+export function readConfiguredRetentionMs() {
+  return RETENTION_DAYS * 24 * 60 * 60 * 1000;
+}
+
+export function getRetentionCutoffMs() {
+  return Date.now() - readConfiguredRetentionMs();
+}
+
+export function getRetentionCutoffSec() {
+  return Math.floor(getRetentionCutoffMs() / 1000);
+}
+
+export function getExpiryTimestampSec() {
+  return Math.floor(Date.now() / 1000) + RETENTION_DAYS * 24 * 60 * 60;
+}

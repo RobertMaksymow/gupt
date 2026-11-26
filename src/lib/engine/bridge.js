@@ -1,0 +1,391 @@
+// Main-thread bridge to the replication worker: spawns it, feeds it identity
+// + relay config, surfaces logs, and fans worker events into the app.
+import { DEFAULT_RELAYS, readConfiguredRelays } from "@/config/servers.js";
+import { debugLog } from "@/lib/debugLog.js";
+import { logSendStage } from "@/lib/sendTrace.js";
+import { notifyRelayAck, setOutboxNotifier, setSyncRequester } from "@/lib/engine/index.js";
+import { applySendReport, markSendComplete } from "@/lib/engine/sendReport.js";
+import {
+  applyOutboxStatus,
+  refreshOutboxStatus,
+  resetOutboxStatus,
+} from "@/lib/engine/outboxStatus.js";
+import { recordOutcomes } from "@/lib/relay/outcomes.js";
+import { getRelayCapacityModes } from "@/lib/idb.js";
+
+let worker = null;
+let currentPubkey = null;
+let relayListenerAttached = false;
+let visibilityListenerAttached = false;
+let failedSignature = "";
+const ingestedListeners = new Set();
+const ackedListeners = new Set();
+const summaryListeners = new Set();
+
+// The fast poll and a full cycle can store the same event concurrently; the UI
+// must ingest and notify once. Keep short (3s) so fast subsequent pulls or room
+// switches do not swallow events.
+const INGESTED_TTL_MS = 3000;
+const INGESTED_CACHE_MAX = 2048;
+const recentIngested = new Map();
+
+// The worker heartbeats every 10s and posts a summary each cycle. Silence
+// means its event loop is gone, while heartbeats without a summary mean a
+// cycle never finished (e.g. a hung fetch). Restart on either, but give a
+// legitimately long attachment sync room.
+const WATCHDOG_INTERVAL_MS = 15_000;
+const WATCHDOG_SILENT_VISIBLE_MS = 60_000;
+const WATCHDOG_SILENT_HIDDEN_MS = 180_000;
+const WATCHDOG_BUSY_MS = 10 * 60_000;
+let watchdogTimer = null;
+let lastWorkerMessageAt = 0;
+let lastSummaryAt = 0;
+
+function relayHost(relay) {
+  try {
+    return new URL(relay).host || String(relay || "");
+  } catch {
+    return String(relay || "");
+  }
+}
+
+function freshIngestedIds(ids) {
+  const now = Date.now();
+  const fresh = [];
+  for (const raw of Array.isArray(ids) ? ids : []) {
+    const id = String(raw || "");
+    if (!id) continue;
+    const seenAt = recentIngested.get(id);
+    if (seenAt && now - seenAt < INGESTED_TTL_MS) continue;
+    recentIngested.set(id, now);
+    fresh.push(id);
+  }
+  if (recentIngested.size > INGESTED_CACHE_MAX) {
+    for (const [id, seenAt] of recentIngested) {
+      if (recentIngested.size <= INGESTED_CACHE_MAX) break;
+      if (now - seenAt > INGESTED_TTL_MS || recentIngested.size > INGESTED_CACHE_MAX) {
+        recentIngested.delete(id);
+      }
+    }
+  }
+  return fresh;
+}
+
+function signalOutboxFailures(status) {
+  const ids = Array.isArray(status?.failedIds) ? status.failedIds : [];
+  const signature = [...ids].sort().join(",");
+  if (signature === failedSignature) return;
+  failedSignature = signature;
+  if (!ids.length) return;
+  debugLog(`[engine] outbox failed after repeated attempts: ${status.failed} event(s)`);
+  if (typeof window !== "undefined") {
+    window.dispatchEvent(
+      new CustomEvent("gupt:outbox-failed", {
+        detail: { count: Number(status.failed) || ids.length, ids },
+      }),
+    );
+  }
+}
+
+function recordEngineRelayOutcomes(entries, operation = null) {
+  if (!Array.isArray(entries) || !entries.length) return;
+  const grouped = { publish: [], query: [], blob: [], connect: [] };
+  for (const entry of entries) {
+    if (!entry?.relay) continue;
+    const op = String(operation || entry.op || entry.operation || "publish");
+    const bucket = grouped[op] || grouped.publish;
+    bucket.push({
+      relay: entry.relay,
+      ok: Boolean(entry.ok),
+      latencyMs: Number(entry.latencyMs) || 0,
+      error: entry.error,
+      mode: entry.mode,
+      maxSingleBytes: entry.maxSingleBytes,
+      remainingBytes: entry.remainingBytes,
+      writable: entry.writable,
+    });
+    // A successful read is a +1 for that relay.
+    if (op === "query" && entry.ok) {
+      grouped.blob.push({
+        relay: entry.relay,
+        ok: true,
+        latencyMs: Number(entry.latencyMs) || 0,
+      });
+    }
+  }
+  for (const [op, outcomes] of Object.entries(grouped)) {
+    if (outcomes.length) recordOutcomes(op, outcomes);
+  }
+}
+
+function ensureWorker() {
+  if (worker) return worker;
+  worker = new Worker(new URL("../../workers/replication.worker.js", import.meta.url), {
+    type: "module",
+    name: "gupt-rabta-engine",
+  });
+  lastWorkerMessageAt = Date.now();
+  lastSummaryAt = Date.now();
+  worker.onmessage = (msg) => {
+    lastWorkerMessageAt = Date.now();
+    const { type } = msg?.data || {};
+    if (type === "log") {
+      debugLog(`[engine] ${msg.data.msg}`);
+    } else if (type === "summary") {
+      const s = msg.data;
+      lastSummaryAt = Date.now();
+      debugLog(
+        `[engine] cycle ${s.cycle}: pushed=${s.pushedEvents} pulled=${s.pulledEvents} blobs=${s.pushedBlobs}+${s.pulledBlobs || 0} errors=${s.errors?.length || 0} ${s.durationMs}ms`,
+      );
+      if (s.outbox) {
+        debugLog(
+          `[engine] outbox: ${s.outbox.pending} pending, ${s.outbox.stuck} stuck, ${s.outbox.failed} failed`,
+        );
+        applyOutboxStatus(s.outbox);
+        signalOutboxFailures(s.outbox);
+      }
+      if (s.errors?.length) {
+        for (const err of s.errors) debugLog(`[engine] error: ${err}`);
+      }
+      recordEngineRelayOutcomes(s.relayOutcomes);
+      for (const listener of summaryListeners) {
+        try {
+          listener(s);
+        } catch {}
+      }
+    } else if (type === "relayOutcomes") {
+      recordEngineRelayOutcomes(msg.data.outcomes, msg.data.operation);
+    } else if (type === "sendReport") {
+      if (msg.data?.report) {
+        const incoming = msg.data.report;
+        logSendStage(incoming.eventId || incoming.id, `relay-${incoming.state || "update"}`, {
+          relay: incoming.relay ? relayHost(incoming.relay) : null,
+          latencyMs: incoming.latencyMs ?? null,
+          timeoutMs: incoming.timeoutMs ?? null,
+          error: incoming.error || null,
+        });
+        const report = applySendReport(incoming);
+        if (report?.state === "complete") {
+          for (const id of [report.id]) notifyRelayAck(id);
+        }
+      }
+    } else if (type === "trace") {
+      logSendStage(msg.data.eventId, msg.data.stage, msg.data.detail || null);
+    } else if (type === "ready") {
+      console.info(`[gupt:send] worker ready across ${Number(msg.data?.relays) || 0} relay(s)`);
+    } else if (type === "ingested") {
+      const ids = freshIngestedIds(msg.data.ids);
+      if (!ids.length) return;
+      for (const listener of ingestedListeners) {
+        try {
+          listener(ids);
+        } catch {}
+      }
+    } else if (type === "acked") {
+      const ids = msg.data.ids || [];
+      debugLog(`[engine] acked ${ids.map((id) => String(id).slice(0, 8)).join(",")}`);
+      for (const id of ids) {
+        logSendStage(id, "acked");
+        notifyRelayAck(id);
+        markSendComplete(id);
+      }
+      for (const listener of ackedListeners) {
+        try {
+          listener(ids);
+        } catch {}
+      }
+    }
+  };
+  worker.onerror = (err) => {
+    console.warn("[gupt:send] replication worker error:", err?.message || err);
+    debugLog(`[engine] worker error: ${err?.message || err}`);
+  };
+  return worker;
+}
+
+export function syncWorkerConfig(pubkeyHex) {
+  const pubkey = String(pubkeyHex || "").toLowerCase();
+  if (!pubkey) return;
+  // An in-flight cycle holds the previous identity's store; kill it so a
+  // switched account can never push the old account's rows.
+  if (worker && currentPubkey && currentPubkey !== pubkey) {
+    worker.postMessage({ type: "stop" });
+    worker.terminate();
+    worker = null;
+  }
+  currentPubkey = pubkey;
+  void pushWorkerConfig(pubkey);
+}
+
+async function pushWorkerConfig(pubkey) {
+  // Reads the last observed battery tier per relay so the engine can skip
+  // read-only nodes for pushes while still pulling from them.
+  let relayModes = {};
+  try {
+    relayModes = await getRelayCapacityModes();
+  } catch {}
+  if (currentPubkey !== pubkey) return;
+  const configured = readConfiguredRelays();
+  const relays = configured.length ? configured : [...DEFAULT_RELAYS];
+  ensureWorker().postMessage({
+    type: "config",
+    pubkeyHex: pubkey,
+    relays,
+    relayModes,
+    hidden: typeof document !== "undefined" ? Boolean(document.hidden) : false,
+  });
+}
+
+/** Nudge the worker after a local publish; an id gets a fast-path push. */
+export function wakeEngine(priorityId = null) {
+  if (!currentPubkey) return;
+  ensureWorker().postMessage({
+    type: "tick",
+    priorityId: priorityId ? String(priorityId) : null,
+  });
+  if (priorityId) logSendStage(priorityId, "worker-woken");
+}
+
+/** Trigger a full cold-range reconciliation cycle. */
+export function triggerEngineReconcile() {
+  if (!currentPubkey) return;
+  ensureWorker().postMessage({ type: "reconcile" });
+}
+
+export function onEngineIngested(listener) {
+  ingestedListeners.add(listener);
+  return () => ingestedListeners.delete(listener);
+}
+
+export function onEngineAcked(listener) {
+  ackedListeners.add(listener);
+  return () => ackedListeners.delete(listener);
+}
+
+export function onEngineSummary(listener) {
+  summaryListeners.add(listener);
+  return () => summaryListeners.delete(listener);
+}
+
+/** Wake the worker and resolve after the next completed sync cycle. */
+export function requestEngineSync({ timeoutMs = 20000, reconcile = false } = {}) {
+  if (!currentPubkey) return Promise.resolve(false);
+  return new Promise((resolve) => {
+    let timer = null;
+    const unsubscribe = onEngineSummary(() => {
+      if (timer) clearTimeout(timer);
+      unsubscribe();
+      resolve(true);
+    });
+    timer = setTimeout(() => {
+      unsubscribe();
+      resolve(false);
+    }, timeoutMs);
+    if (reconcile) triggerEngineReconcile();
+    else wakeEngine();
+  });
+}
+
+function restartWedgedWorker(reason) {
+  if (!currentPubkey) return;
+  debugLog(`[engine] watchdog: ${reason}; restarting replication worker`);
+  const pubkey = currentPubkey;
+  if (worker) {
+    try {
+      worker.postMessage({ type: "stop" });
+    } catch {}
+    try {
+      worker.terminate();
+    } catch {}
+    worker = null;
+  }
+  lastWorkerMessageAt = Date.now();
+  lastSummaryAt = Date.now();
+  syncWorkerConfig(pubkey);
+}
+
+function checkWorkerHealth() {
+  if (!currentPubkey || !worker) return false;
+  const now = Date.now();
+  const hidden = typeof document !== "undefined" && Boolean(document.hidden);
+  const silentLimit = hidden ? WATCHDOG_SILENT_HIDDEN_MS : WATCHDOG_SILENT_VISIBLE_MS;
+  if (now - lastWorkerMessageAt >= silentLimit) {
+    restartWedgedWorker(`worker silent for ${Math.round((now - lastWorkerMessageAt) / 1000)}s`);
+    return true;
+  }
+  if (now - lastSummaryAt >= WATCHDOG_BUSY_MS) {
+    restartWedgedWorker(`sync cycle running for ${Math.round((now - lastSummaryAt) / 1000)}s`);
+    return true;
+  }
+  return false;
+}
+
+function startWatchdog() {
+  if (watchdogTimer || typeof window === "undefined") return;
+  lastWorkerMessageAt = Date.now();
+  lastSummaryAt = Date.now();
+  watchdogTimer = setInterval(() => {
+    checkWorkerHealth();
+  }, WATCHDOG_INTERVAL_MS);
+}
+
+function stopWatchdog() {
+  if (!watchdogTimer) return;
+  clearInterval(watchdogTimer);
+  watchdogTimer = null;
+}
+
+export function startEngineBridge(pubkeyHex) {
+  setOutboxNotifier(wakeEngine);
+  setSyncRequester(requestEngineSync);
+  syncWorkerConfig(pubkeyHex);
+  startWatchdog();
+  void refreshOutboxStatus(pubkeyHex);
+  if (typeof window !== "undefined" && !relayListenerAttached) {
+    relayListenerAttached = true;
+    window.addEventListener("gupt:relays-changed", onRelaysChanged);
+  }
+  if (typeof document !== "undefined" && !visibilityListenerAttached) {
+    visibilityListenerAttached = true;
+    document.addEventListener("visibilitychange", onVisibilityChanged);
+  }
+  return stopEngineBridge;
+}
+
+function onRelaysChanged() {
+  if (currentPubkey) syncWorkerConfig(currentPubkey);
+}
+
+function onVisibilityChanged() {
+  if (!currentPubkey) return;
+  if (!document.hidden && checkWorkerHealth()) return;
+  ensureWorker().postMessage({ type: "visibility", hidden: Boolean(document.hidden) });
+}
+
+export function stopEngineBridge() {
+  if (typeof window !== "undefined" && relayListenerAttached) {
+    relayListenerAttached = false;
+    window.removeEventListener("gupt:relays-changed", onRelaysChanged);
+  }
+  if (typeof document !== "undefined" && visibilityListenerAttached) {
+    visibilityListenerAttached = false;
+    document.removeEventListener("visibilitychange", onVisibilityChanged);
+  }
+  setOutboxNotifier(null);
+  setSyncRequester(null);
+  ingestedListeners.clear();
+  ackedListeners.clear();
+  summaryListeners.clear();
+  recentIngested.clear();
+  failedSignature = "";
+  resetOutboxStatus();
+  stopWatchdog();
+  lastWorkerMessageAt = 0;
+  lastSummaryAt = 0;
+  if (worker) {
+    worker.postMessage({ type: "stop" });
+    worker.terminate();
+    worker = null;
+  }
+  currentPubkey = null;
+}

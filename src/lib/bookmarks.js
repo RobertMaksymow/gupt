@@ -1,0 +1,298 @@
+import { finalizeEvent } from "./crypto.js";
+import { hexToBytes } from "@noble/hashes/utils.js";
+import { encryptDm, decryptDm, normalizePubkey } from "./crypto.js";
+import { getRawEventsByOrigin, deleteRawEvent } from "./idb";
+import { publishLocal, requestEngineSync } from "./engine";
+import { renewStreamItems } from "./streamRenewal.js";
+import { STREAM_EXPIRY_SECONDS, STREAM_DELETE_EXPIRY_SECONDS } from "@/config/retention";
+
+const BOOKMARK_KIND = 1;
+const BOOKMARK_TAG = "gupt_bookmark";
+
+const TRACKING_PARAMS = new Set([
+  "fbclid",
+  "gclid",
+  "gclsrc",
+  "dclid",
+  "msclkid",
+  "mc_cid",
+  "mc_eid",
+  "igshid",
+  "si",
+]);
+
+function newId() {
+  return typeof crypto.randomUUID === "function"
+    ? crypto.randomUUID()
+    : `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+}
+
+/** Normalize URL for storage and dedupe. */
+export function normalizeBookmarkUrl(raw) {
+  const input = String(raw || "").trim();
+  if (!input) return "";
+  let parsed;
+  try {
+    parsed = new URL(input);
+  } catch {
+    try {
+      parsed = new URL(`https://${input}`);
+    } catch {
+      return "";
+    }
+  }
+  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return "";
+
+  parsed.hash = "";
+  parsed.hostname = parsed.hostname.toLowerCase();
+  if (parsed.hostname.startsWith("www.")) {
+    parsed.hostname = parsed.hostname.slice(4);
+  }
+
+  const keys = [...parsed.searchParams.keys()];
+  for (const key of keys) {
+    const lower = key.toLowerCase();
+    if (lower.startsWith("utm_") || TRACKING_PARAMS.has(lower)) {
+      parsed.searchParams.delete(key);
+    }
+  }
+
+  let path = parsed.pathname || "/";
+  if (path.length > 1 && path.endsWith("/")) path = path.slice(0, -1);
+  parsed.pathname = path || "/";
+
+  return parsed.toString();
+}
+
+export function bookmarkHostname(url) {
+  try {
+    return new URL(url).hostname.replace(/^www\./, "") || url;
+  } catch {
+    return url || "";
+  }
+}
+
+/** Normalize user tags: lowercase, trimmed, unique, spaces → -, no empty. */
+export function normalizeBookmarkTags(tags) {
+  if (!Array.isArray(tags)) return [];
+  const seen = new Set();
+  const out = [];
+  for (const raw of tags) {
+    const t = String(raw || "")
+      .trim()
+      .toLowerCase()
+      .replace(/\s+/g, "-")
+      .replace(/-+/g, "-")
+      .replace(/^-+|-+$/g, "")
+      .slice(0, 32);
+    if (!t || seen.has(t)) continue;
+    seen.add(t);
+    out.push(t);
+  }
+  return out;
+}
+
+/** Parse a comma-separated tag string into normalized tags. */
+export function parseBookmarkTagsInput(raw) {
+  return normalizeBookmarkTags(
+    String(raw || "")
+      .split(",")
+      .map((t) => t.trim())
+      .filter(Boolean),
+  );
+}
+
+async function publishBookmarkEvent(privkeyHex, pubkeyHex, payload, expirySeconds) {
+  const encryptedPayload = await encryptDm(privkeyHex, pubkeyHex, JSON.stringify(payload));
+  const expiryTimestamp = Math.floor(Date.now() / 1000) + expirySeconds;
+  const event = finalizeEvent(
+    {
+      collection: "gupt/vault/bookmarks",
+      labels: [BOOKMARK_TAG, pubkeyHex],
+      data: {
+        v: 1,
+        nonce: encryptedPayload.nonce,
+        ciphertext: encryptedPayload.ciphertext,
+      },
+      created_at: Math.floor(Date.now() / 1000),
+      expires_at: expiryTimestamp,
+      kind: BOOKMARK_KIND,
+      tags: [
+        ["p", pubkeyHex],
+        ["t", BOOKMARK_TAG],
+        [BOOKMARK_TAG, String(encryptedPayload)],
+        ["expiration", String(expiryTimestamp)],
+      ],
+      content: "Bookmark : https://github.com/besoeasy/gupt",
+    },
+    hexToBytes(privkeyHex),
+  );
+
+  await publishLocal(event, { origin: "bookmarks" });
+  return { ...payload, eventId: event.id, expiresAt: expiryTimestamp * 1000 };
+}
+
+async function decryptBookmarkEvents(privkeyHex, pubkeyHex, events) {
+  const items = [];
+  for (const event of events) {
+    const encrypted = event.data?.ciphertext
+      ? event.data
+      : event.tags?.find((t) => t[0] === BOOKMARK_TAG)?.[1] || event.data?.content || event.content;
+    if (!encrypted) continue;
+    try {
+      const plaintext = await decryptDm(privkeyHex, pubkeyHex, encrypted);
+      const item = JSON.parse(plaintext);
+      if (!item?.id) continue;
+      item.eventId = event.id;
+      if (!item.deleted) {
+        item.tags = normalizeBookmarkTags(item.tags);
+      }
+      const expiryTag = event.tags?.find((t) => t[0] === "expiration");
+      if (expiryTag) {
+        item.expiresAt = Number(expiryTag[1]) * 1000;
+        if (item.expiresAt < Date.now()) continue;
+      }
+      items.push(item);
+    } catch (err) {
+      console.warn("Failed to decrypt a bookmark", err);
+    }
+  }
+  return items;
+}
+
+/** Collapse stream: tombstone wins; else newest live by updatedAt. */
+export function reduceBookmarks(items) {
+  const deletedIds = new Set();
+  const liveById = new Map();
+
+  for (const item of items) {
+    if (item.deleted === true) {
+      deletedIds.add(item.id);
+      liveById.delete(item.id);
+      continue;
+    }
+    if (deletedIds.has(item.id)) continue;
+    const prev = liveById.get(item.id);
+    if (!prev || (item.updatedAt || 0) >= (prev.updatedAt || 0)) {
+      liveById.set(item.id, item);
+    }
+  }
+
+  return [...liveById.values()].sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
+}
+
+export async function getBookmarksCached(privkeyHex, pubkeyHex) {
+  const rows = await getRawEventsByOrigin("bookmarks").catch(() => []);
+  if (!rows.length) return null;
+  const events = rows.map((r) => r.event);
+  const decrypted = await decryptBookmarkEvents(privkeyHex, pubkeyHex, events);
+  return { items: reduceBookmarks(decrypted), fresh: false };
+}
+
+export async function fetchBookmarks(privkeyHex, pubkeyHex) {
+  const pubkey = normalizePubkey(pubkeyHex);
+  if (!pubkey) throw new Error("Invalid pubkey");
+
+  await requestEngineSync();
+  const cached = await getBookmarksCached(privkeyHex, pubkeyHex);
+  return cached?.items || [];
+}
+
+/**
+ * Create or update a bookmark. Same normalized URL renews existing id.
+ * Tags stay inside ciphertext only, never as public event tags.
+ */
+export async function saveBookmark(
+  privkeyHex,
+  pubkeyHex,
+  { title, url, tags },
+  existingItems = null,
+) {
+  const normalizedUrl = normalizeBookmarkUrl(url);
+  if (!normalizedUrl) throw new Error("A valid URL is required.");
+
+  const items =
+    existingItems ||
+    (await getBookmarksCached(privkeyHex, pubkeyHex).catch(() => null))?.items ||
+    [];
+  const existing = items.find((b) => b.url === normalizedUrl);
+  const now = Date.now();
+  const resolvedTitle = String(title || "").trim() || bookmarkHostname(normalizedUrl) || "Bookmark";
+  const resolvedTags = normalizeBookmarkTags(tags !== undefined ? tags : existing?.tags || []);
+
+  if (existing) {
+    const payload = {
+      v: 1,
+      id: existing.id,
+      title: resolvedTitle,
+      url: normalizedUrl,
+      tags: resolvedTags,
+      createdAt: existing.createdAt || now,
+      updatedAt: now,
+      prevEventId: existing.eventId || null,
+    };
+    return publishBookmarkEvent(privkeyHex, pubkeyHex, payload, STREAM_EXPIRY_SECONDS);
+  }
+
+  const payload = {
+    v: 1,
+    id: newId(),
+    title: resolvedTitle,
+    url: normalizedUrl,
+    tags: resolvedTags,
+    createdAt: now,
+    updatedAt: now,
+    prevEventId: null,
+  };
+  return publishBookmarkEvent(privkeyHex, pubkeyHex, payload, STREAM_EXPIRY_SECONDS);
+}
+
+/** Renew a live bookmark (same id, new expiry, prevEventId chain). */
+export async function renewBookmark(privkeyHex, pubkeyHex, bookmark) {
+  if (!bookmark?.id || !bookmark?.url) throw new Error("Invalid bookmark.");
+  const now = Date.now();
+  const payload = {
+    v: 1,
+    id: bookmark.id,
+    title: bookmark.title || bookmarkHostname(bookmark.url) || "Bookmark",
+    url: bookmark.url,
+    tags: normalizeBookmarkTags(bookmark.tags),
+    createdAt: bookmark.createdAt || now,
+    updatedAt: now,
+    prevEventId: bookmark.eventId || null,
+  };
+  return publishBookmarkEvent(privkeyHex, pubkeyHex, payload, STREAM_EXPIRY_SECONDS);
+}
+
+/** Delete via never-renewed tombstone (no Kind 5). */
+export async function deleteBookmark(privkeyHex, pubkeyHex, bookmark) {
+  if (!bookmark?.id) throw new Error("Invalid bookmark.");
+  const now = Date.now();
+  const payload = {
+    v: 1,
+    id: bookmark.id,
+    deleted: true,
+    createdAt: bookmark.createdAt || now,
+    updatedAt: now,
+    prevEventId: bookmark.eventId || null,
+  };
+  const result = await publishBookmarkEvent(
+    privkeyHex,
+    pubkeyHex,
+    payload,
+    STREAM_DELETE_EXPIRY_SECONDS,
+  );
+  if (bookmark.eventId) {
+    await deleteRawEvent(bookmark.eventId).catch(() => {});
+  }
+  return result;
+}
+
+/** Renew stream items via the shared policy (see streamRenewal.js). */
+export async function renewExpiringBookmarks(privkeyHex, pubkeyHex, items, opts = {}) {
+  return renewStreamItems(
+    items,
+    (bookmark) => renewBookmark(privkeyHex, pubkeyHex, bookmark),
+    opts,
+  );
+}

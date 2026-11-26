@@ -1,0 +1,86 @@
+import { getDmSharedSecret, aesDecrypt, normalizePubkey } from "./crypto.js";
+
+const PAYLOAD_CACHE_CAP = 2000;
+
+const secretCache = new Map();
+
+const payloadCache = new Map();
+
+function secretCacheKey(privkeyHex, peerPubkey) {
+  return `${privkeyHex}:${peerPubkey}`;
+}
+
+function getSharedSecret(privkeyHex, peerPubkey) {
+  const key = secretCacheKey(privkeyHex, peerPubkey);
+  let secret = secretCache.get(key);
+  if (!secret) {
+    secret = getDmSharedSecret(privkeyHex, peerPubkey);
+    secretCache.set(key, secret);
+  }
+  return secret;
+}
+
+export async function decryptRow(privkeyHex, selfPubkey, row) {
+  const author = normalizePubkey(row.event?.pubkey || row.event?.owner);
+  const cached = payloadCache.get(row.id);
+  if (cached) {
+    return {
+      ...cached,
+      id: row.id,
+      sender: author,
+      mine: author === selfPubkey,
+      created_at: row.createdAt,
+      expiresAt: Number(row.expiresAt || 0) || undefined,
+      peerPubkey: row.peerPubkey || null,
+    };
+  }
+
+  const peerPubkey = row.peerPubkey || author;
+  const secret = getSharedSecret(privkeyHex, peerPubkey);
+  const plaintext = await aesDecrypt(secret, row.event.data || row.event.content);
+  const payload = JSON.parse(plaintext);
+
+  const result = {
+    ...payload,
+    id: row.id,
+    sender: author,
+    mine: author === selfPubkey,
+    type: row.type || payload.type,
+    text: payload.text ?? "",
+    ts: payload.ts ?? row.createdAt,
+    media: payload.media ?? null,
+    created_at: row.createdAt,
+    // The raw event row already carries its own deadline (from the signed
+    // `expiration` tag). Keep it on the message so an open chat can drop it.
+    expiresAt: Number(row.expiresAt || 0) || undefined,
+    peerPubkey: row.peerPubkey || null,
+  };
+
+  if (payloadCache.size >= PAYLOAD_CACHE_CAP) {
+    const firstKey = payloadCache.keys().next().value;
+    payloadCache.delete(firstKey);
+  }
+  payloadCache.set(row.id, payload);
+
+  return result;
+}
+
+export async function decryptRows(privkeyHex, selfPubkey, rows) {
+  const settled = await Promise.allSettled(
+    rows.map((row) => decryptRow(privkeyHex, selfPubkey, row)),
+  );
+
+  const succeeded = settled.filter((res) => res.status === "fulfilled");
+  const failed = settled.filter((res) => res.status === "rejected");
+
+  if (failed.length > 0) {
+  } else {
+  }
+
+  return succeeded.map((res) => res.value);
+}
+
+export function clearDecryptCache() {
+  secretCache.clear();
+  payloadCache.clear();
+}
